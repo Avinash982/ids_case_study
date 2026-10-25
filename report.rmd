@@ -1,0 +1,498 @@
+---
+title: "Airline and Hotel Review Text Mining and Rating Prediction"
+author: "Add your name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    code_folding: hide
+---
+
+# Abstract
+
+This report analyzes airline and hotel customer reviews using R. It covers data loading, text cleaning, data-quality assessment, rating distributions, subgroup analysis, frequent-word analysis, a simple lexicon-based sentiment score, rating prediction using linear regression, and recommendations based on review patterns.
+
+The report is generated from the project's R Markdown source. Results depend on the datasets supplied by the user and are calculated when the document is knitted.
+
+# Dataset requirements
+
+Place these two files in the project folder or inside a `data/` folder:
+
+- `BA_AirlineReviews.csv`
+- `Hotel_Reviews.csv`
+
+A ZIP archive containing the CSV files can also be placed in the project folder or `data/` folder. The report attempts to extract ZIP archives automatically.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+# Project setup
+# Keep the CSV files in the project folder or in a subfolder such as data/.
+output_dir <- "outputs"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+packages <- c("readr", "dplyr", "stringr", "ggplot2", "tidyr",
+              "tidytext", "broom", "scales", "knitr")
+
+for (p in packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+invisible(lapply(packages, library, character.only = TRUE))
+set.seed(42)
+
+# Extract ZIP files in the project folder or data/ folder, if present.
+search_roots <- c(".", "data")
+search_roots <- search_roots[dir.exists(search_roots)]
+zip_files <- unique(unlist(lapply(search_roots, function(path) {
+  list.files(path, pattern = "\\.zip$", recursive = TRUE, full.names = TRUE)
+})))
+
+if (length(zip_files) > 0) {
+  extract_dir <- file.path("data", "extracted")
+  dir.create(extract_dir, showWarnings = FALSE, recursive = TRUE)
+  for (zip_file in zip_files) {
+    try(unzip(zip_file, exdir = extract_dir), silent = TRUE)
+  }
+}
+
+# Find datasets in the current project, data/, or extracted ZIP folder.
+all_files <- unique(unlist(lapply(c(".", "data"), function(path) {
+  if (dir.exists(path)) {
+    list.files(path, pattern = "\\.csv$", recursive = TRUE,
+               full.names = TRUE, ignore.case = TRUE)
+  } else character(0)
+})))
+all_files <- all_files[!grepl(paste0("[/\\\\]", output_dir, "[/\\\\]"), all_files)]
+
+airline_matches <- all_files[tolower(basename(all_files)) == "ba_airlinereviews.csv"]
+hotel_matches <- all_files[tolower(basename(all_files)) == "hotel_reviews.csv"]
+
+if (length(airline_matches) == 0 || length(hotel_matches) == 0) {
+  stop(paste0(
+    "Required datasets not found. Place BA_AirlineReviews.csv and ",
+    "Hotel_Reviews.csv in the project folder or data/ folder, then knit again."
+  ))
+}
+
+airline_csv_path <- airline_matches[1]
+hotel_csv_path <- hotel_matches[1]
+
+airline_raw <- readr::read_csv(
+  airline_csv_path, show_col_types = FALSE, progress = FALSE,
+  name_repair = "unique"
+)
+hotel_raw <- readr::read_csv(
+  hotel_csv_path, show_col_types = FALSE, progress = FALSE,
+  name_repair = "unique"
+)
+
+cat("Airline dataset:", airline_csv_path, "\\n")
+cat("Hotel dataset:", hotel_csv_path, "\\n")
+cat("Airline dimensions:", nrow(airline_raw), "rows x", ncol(airline_raw), "columns\\n")
+cat("Hotel dimensions:", nrow(hotel_raw), "rows x", ncol(hotel_raw), "columns\\n")
+
+```
+
+# Step 1: Initialize project, packages, and file paths
+
+The report creates an `outputs/` folder for tables, cleaned datasets, charts, and the generated archive. Required R packages are installed if they are not already available.
+
+# Step 2: Locate and load datasets
+
+The report searches the project folder and its subfolders for the airline and hotel CSV files. It then loads both datasets and reports their dimensions and column names.
+
+```{r dataset-columns}
+knitr::kable(data.frame(
+  Dataset = c("Airline", "Hotel"),
+  Rows = c(nrow(airline_raw), nrow(hotel_raw)),
+  Columns = c(ncol(airline_raw), ncol(hotel_raw))
+), caption = "Dataset dimensions")
+
+knitr::kable(data.frame(
+  Airline_Columns = c(names(airline_raw), rep("", max(0, length(names(hotel_raw)) - length(names(airline_raw))))[seq_len(max(length(names(airline_raw)), length(names(hotel_raw))))]
+), caption = "Airline dataset column names")
+cat("\nHotel dataset columns:\n")
+print(names(hotel_raw))
+```
+
+# Step 3: Helper functions for data preprocessing
+
+The helper functions locate columns despite differences in capitalization or punctuation, safely convert values to numeric form, parse common date formats, and normalize review text.
+
+```{r preprocessing-helpers}
+find_col <- function(df, candidates) {
+  normalise <- function(x) tolower(gsub("[^a-z0-9]", "", x))
+  nms <- names(df)
+  idx <- match(normalise(candidates), normalise(nms), nomatch = 0)
+  idx <- idx[idx > 0]
+  if (length(idx)) nms[idx[1]] else NA_character_
+}
+
+get_text <- function(df, candidates, default = "") {
+  col <- find_col(df, candidates)
+  if (is.na(col)) return(rep(default, nrow(df)))
+  as.character(df[[col]])
+}
+
+get_numeric <- function(df, candidates) {
+  col <- find_col(df, candidates)
+  if (is.na(col)) return(rep(NA_real_, nrow(df)))
+  suppressWarnings(as.numeric(as.character(df[[col]])))
+}
+
+parse_review_date <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x, "(?<=\\d)(st|nd|rd|th)\\b", "")
+  res <- tryCatch({
+    suppressWarnings(as.Date(x, tryFormats = c("%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y")))
+  }, error = function(e) {
+    vapply(x, function(val) {
+      if (is.na(val) || !nzchar(val)) return(NA_real_)
+      parsed <- tryCatch(suppressWarnings(as.Date(val, tryFormats = c("%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y"))), error = function(err) NA)
+      if (inherits(parsed, "Date")) as.numeric(parsed) else NA_real_
+    }, numeric(1))
+  })
+  if (is.numeric(res)) res <- as.Date(res, origin = "1970-01-01")
+  res
+}
+
+clean_text <- function(x) {
+  x <- ifelse(is.na(x), "", as.character(x))
+  x <- stringr::str_replace_all(x, "<[^>]+>", " ")
+  x <- stringr::str_replace_all(x, "[\r\n\t]", " ")
+  stringr::str_squish(x)
+}
+```
+
+# Step 4: Clean and prepare datasets
+
+The following functions standardize airline and hotel review data into consistent fields, including rating, date, review text, and relevant category information. Ratings outside the expected 0–10 range are treated as missing.
+
+```{r prepare-datasets}
+prepare_airline <- function(df) {
+  rating <- get_numeric(df, c("OverallRating", "Rating"))
+  title <- get_text(df, c("ReviewHeader", "Review Title", "Title"))
+  body <- get_text(df, c("ReviewBody", "Review Text", "Review"))
+  date_text <- get_text(df, c("Datetime", "ReviewDate", "Date"))
+  date_flown <- get_text(df, c("DateFlown"))
+  traveller <- get_text(df, c("TypeOfTraveller", "Type of Traveller"), "Unknown")
+  seat <- get_text(df, c("SeatType", "Seat Type"), "Unknown")
+  route <- get_text(df, c("Route"), "Unknown")
+  recommended <- get_text(df, c("Recommended"), "Unknown")
+
+  date_parsed <- parse_review_date(date_text)
+  fallback_dates <- parse_review_date(date_flown)
+  missing_dates <- is.na(date_parsed)
+  date_parsed[missing_dates] <- fallback_dates[missing_dates]
+
+  review_text <- clean_text(paste(title, body))
+
+  out <- data.frame(
+    domain = "Airline", entity = "Airline", rating = rating, review_date = date_parsed, review_text = review_text,
+    traveller_type = clean_text(traveller), seat_type = clean_text(seat), route = clean_text(route), recommended = clean_text(recommended),
+    seat_comfort = get_numeric(df, c("SeatComfort", "Seat Comfort")),
+    cabin_staff_service = get_numeric(df, c("CabinStaffService", "Cabin Staff Service")),
+    ground_service = get_numeric(df, c("GroundService", "Ground Service")),
+    food_beverages = get_numeric(df, c("Food&Beverages", "Food and Beverages", "FoodBeverages")),
+    value_for_money = get_numeric(df, c("ValueForMoney", "Value for Money")),
+    stringsAsFactors = FALSE
+  )
+  idx <- is.na(out$cabin_staff_service)
+  out$cabin_staff_service[idx] <- out$ground_service[idx]
+  out$rating <- ifelse(out$rating < 0 | out$rating > 10, NA, out$rating)
+  out$rating_group <- ifelse(is.na(out$rating), NA_character_, ifelse(out$rating >= 7, "Positive", ifelse(out$rating >= 5, "Neutral", "Negative")))
+  out <- out[nzchar(out$review_text), , drop = FALSE]
+  out
+}
+
+prepare_hotel <- function(df) {
+  rating <- get_numeric(df, c("Reviewer_Score", "Reviewer Score", "Rating"))
+  hotel_name <- get_text(df, c("Hotel_Name", "Hotel Name"), "Hotel")
+  positive <- get_text(df, c("Positive_Review", "Positive Review"))
+  negative <- get_text(df, c("Negative_Review", "Negative Review"))
+  review_date <- get_text(df, c("Review_Date", "Review Date"))
+  nationality <- get_text(df, c("Reviewer_Nationality", "Reviewer Nationality"), "Unknown")
+  tags <- get_text(df, c("Tags"), "")
+  avg_score <- get_numeric(df, c("Average_Score", "Average Score"))
+
+  review_text <- clean_text(paste(positive, negative))
+
+  out <- data.frame(
+    domain = "Hotel", entity = clean_text(hotel_name), rating = rating, review_date = parse_review_date(review_date), review_text = review_text,
+    positive_text = clean_text(positive), negative_text = clean_text(negative), nationality = clean_text(nationality), tags = clean_text(tags), hotel_average_score = avg_score,
+    stringsAsFactors = FALSE
+  )
+  out$rating <- ifelse(out$rating < 0 | out$rating > 10, NA, out$rating)
+  out$rating_group <- ifelse(is.na(out$rating), NA_character_, ifelse(out$rating >= 8, "Positive", ifelse(out$rating >= 6, "Neutral", "Negative")))
+  out <- out[nzchar(out$review_text), , drop = FALSE]
+  out
+}
+
+airline <- prepare_airline(airline_raw)
+hotel <- prepare_hotel(hotel_raw)
+```
+
+## Preview of cleaned data
+
+```{r cleaned-preview}
+knitr::kable(utils::head(airline, 6), caption = "Airline cleaned-data preview")
+knitr::kable(utils::head(hotel, 6), caption = "Hotel cleaned-data preview")
+```
+
+# Step 5: Data-quality reports and summary statistics
+
+The quality report counts usable reviews, missing ratings, missing dates, empty review text, duplicate text, and average ratings. Summary statistics report rating averages, medians, standard deviations, and the distribution of rating-based sentiment groups.
+
+```{r quality-summary}
+data_quality <- function(df, label) {
+  data.frame(
+    Dataset = label, Usable_reviews = nrow(df), Missing_ratings = sum(is.na(df$rating)),
+    Missing_dates = sum(is.na(df$review_date)), Empty_text = sum(!nzchar(df$review_text)),
+    Duplicate_text = sum(duplicated(df$review_text)), Average_rating = round(mean(df$rating, na.rm = TRUE), 3)
+  )
+}
+
+quality <- dplyr::bind_rows(data_quality(airline, "Airline"), data_quality(hotel, "Hotel"))
+cat("\n================ DATA QUALITY ================\n")
+print(quality)
+write.csv(quality, file.path(output_dir, "data_quality.csv"), row.names = FALSE)
+
+summary_table <- function(df, label) {
+  data.frame(
+    Dataset = label, Reviews = nrow(df), Valid_ratings = sum(!is.na(df$rating)),
+    Average_rating = round(mean(df$rating, na.rm = TRUE), 3), Median_rating = round(median(df$rating, na.rm = TRUE), 3),
+    Rating_SD = round(sd(df$rating, na.rm = TRUE), 3),
+    Positive_pct = round(mean(df$rating_group == "Positive", na.rm = TRUE) * 100, 2),
+    Neutral_pct = round(mean(df$rating_group == "Neutral", na.rm = TRUE) * 100, 2),
+    Negative_pct = round(mean(df$rating_group == "Negative", na.rm = TRUE) * 100, 2)
+  )
+}
+
+summary_results <- dplyr::bind_rows(summary_table(airline, "Airline"), summary_table(hotel, "Hotel"))
+cat("\n================ DATASET SUMMARY ================\n")
+print(summary_results)
+write.csv(summary_results, file.path(output_dir, "dataset_summary.csv"), row.names = FALSE)knitr::kable(quality, caption = "Data quality summary")
+knitr::kable(summary_results, caption = "Rating summary statistics")
+
+```
+
+# Step 6: Visualizations — rating and sentiment distributions
+
+Rating histograms show how ratings are distributed. The sentiment charts classify reviews using rating thresholds defined in the data-preparation step; these are rating-based groups, not a human-annotated sentiment ground truth.
+
+```{r rating-sentiment-plots, fig.width=8, fig.height=5}
+plot_rating <- function(df, label, filename) {
+  p <- ggplot(df[!is.na(df$rating), ], aes(x = rating)) +
+    geom_histogram(bins = 20, fill = "#2878B5", color = "white", na.rm = TRUE) +
+    labs(title = paste(label, "Rating Distribution"), x = "Rating", y = "Number of Reviews") +
+    theme_minimal(base_size = 13)
+  print(p)
+  ggsave(file.path(output_dir, filename), p, width = 8, height = 5, dpi = 150)
+}
+
+plot_sentiment <- function(df, label, filename) {
+  z <- df |> dplyr::filter(!is.na(rating_group)) |> dplyr::count(rating_group) |> dplyr::mutate(percent = n / sum(n) * 100)
+  p <- ggplot(z, aes(x = rating_group, y = percent, fill = rating_group)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = paste0(round(percent, 1), "%")), vjust = -0.4) +
+    labs(title = paste(label, "Rating-Based Sentiment"), x = NULL, y = "Percentage of Reviews") +
+    theme_minimal(base_size = 13)
+  print(p)
+  ggsave(file.path(output_dir, filename), p, width = 8, height = 5, dpi = 150)
+}
+
+plot_rating(airline, "Airline", "airline_rating_distribution.png")
+plot_rating(hotel, "Hotel", "hotel_rating_distribution.png")
+plot_sentiment(airline, "Airline", "airline_sentiment.png")
+plot_sentiment(hotel, "Hotel", "hotel_sentiment.png")
+```
+
+# Step 7: Service and category subgroup analysis
+
+Airline service attributes are summarized where those fields are available. Additional subgroup comparisons examine average ratings by airline traveller type and hotel reviewer nationality, retaining categories with at least five reviews.
+
+```{r subgroup-analysis}
+service_columns <- c("seat_comfort", "cabin_staff_service", "ground_service", "food_beverages", "value_for_money")
+service_results <- data.frame(
+  Service = service_columns,
+  Average_score = sapply(service_columns, function(col) mean(airline[[col]], na.rm = TRUE)),
+  Valid_reviews = sapply(service_columns, function(col) sum(!is.na(airline[[col]])))
+)
+service_results <- service_results[is.finite(service_results$Average_score), , drop = FALSE]
+
+if (nrow(service_results)) {
+  p_service <- ggplot(service_results, aes(x = reorder(Service, Average_score), y = Average_score)) +
+    geom_col(fill = "#168C7A") + coord_flip() +
+    labs(title = "Average Airline Service Ratings", x = NULL, y = "Average Service Score") +
+    theme_minimal(base_size = 13)
+  print(p_service)
+  ggsave(file.path(output_dir, "airline_service_ratings.png"), p_service, width = 8, height = 5, dpi = 150)
+}
+
+category_analysis <- function(df, category_col, label) {
+  if (!category_col %in% names(df)) return(NULL)
+  z <- df |> dplyr::mutate(category = as.character(.data[[category_col]])) |>
+    dplyr::filter(!is.na(category), nzchar(category), !is.na(rating)) |>
+    dplyr::group_by(category) |>
+    dplyr::summarise(reviews = dplyr::n(), average_rating = mean(rating), .groups = "drop") |>
+    dplyr::filter(reviews >= 5) |> dplyr::arrange(desc(reviews)) |> head(15)
+
+  if (nrow(z)) {
+    p <- ggplot(z, aes(x = reorder(category, average_rating), y = average_rating)) +
+      geom_col(fill = "#D18B2C") + coord_flip() +
+      labs(title = paste("Average Rating by", label), x = NULL, y = "Average Rating") +
+      theme_minimal(base_size = 12)
+    print(p)
+    ggsave(file.path(output_dir, paste0(gsub("[^a-z]+", "_", tolower(label)), "_category_ratings.png")), p, width = 9, height = 6, dpi = 150)
+  }
+  z
+}
+
+traveller_results <- category_analysis(airline, "traveller_type", "Airline Traveller Type")
+nationality_results <- category_analysis(hotel, "nationality", "Hotel Reviewer Nationality")
+if (!is.null(traveller_results)) knitr::kable(traveller_results, caption = "Ratings by airline traveller type")
+if (!is.null(nationality_results)) knitr::kable(nationality_results, caption = "Ratings by hotel reviewer nationality")
+```
+
+# Step 8: Text mining and frequent words
+
+Reviews are tokenized into words. Common stop words and project-specific generic terms are removed before the most frequent words are counted. Word frequency is descriptive and does not by itself establish customer intent or causation.
+
+```{r text-mining}
+stop_words_extra <- c("flight", "flights", "airline", "hotel", "room", "rooms", "stay", "stayed", "would", "could", "also", "one", "two", "get", "got", "really", "much", "even", "still", "back", "said", "told", "day", "days", "time", "first", "last", "good", "great", "excellent", "bad", "poor")
+
+mine_words <- function(df, label, filename) {
+  tokens <- data.frame(text = df$review_text) |> tidytext::unnest_tokens(word, text) |>
+    dplyr::filter(stringr::str_detect(word, "^[a-z]{3,}$"), !word %in% tidytext::stop_words$word, !word %in% stop_words_extra) |>
+    dplyr::count(word, sort = TRUE)
+  top_words <- head(tokens, 25)
+  if (nrow(top_words)) {
+    p <- ggplot(top_words, aes(x = reorder(word, n), y = n)) + geom_col(fill = "#2878B5") + coord_flip() +
+      labs(title = paste("Most Frequent Words -", label), x = NULL, y = "Frequency") + theme_minimal(base_size = 12)
+    print(p)
+    ggsave(file.path(output_dir, filename), p, width = 8, height = 7, dpi = 150)
+  }
+  write.csv(top_words, file.path(output_dir, paste0(tolower(label), "_top_words.csv")), row.names = FALSE)
+  top_words
+}
+
+airline_words <- mine_words(airline, "Airline", "airline_top_words.png")
+hotel_words <- mine_words(hotel, "Hotel", "hotel_top_words.png")
+knitr::kable(airline_words, caption = "Frequent words in airline reviews")
+knitr::kable(hotel_words, caption = "Frequent words in hotel reviews")
+```
+
+# Step 9: Sentiment scoring and rating prediction
+
+A simple lexicon score is calculated by counting words in predefined positive and negative word lists. Linear regression then predicts ratings from the lexicon score and review word count. The data is randomly divided into training and test sets; MAE, RMSE, and test-set R-squared are reported when sufficient observations are available.
+
+This is a baseline model, not a guarantee of accurate predictions. The word lists are intentionally simple and may miss context, negation, sarcasm, and domain-specific language.
+
+```{r predictive-modeling, fig.width=7, fig.height=6}
+positive_words <- c("good", "great", "excellent", "amazing", "wonderful", "friendly", "helpful", "comfortable", "clean", "love", "best", "smooth", "enjoyed", "pleasant", "efficient", "professional", "fantastic", "perfect", "recommend", "happy")
+negative_words <- c("bad", "poor", "terrible", "awful", "worst", "rude", "uncomfortable", "dirty", "delay", "delayed", "late", "broken", "slow", "expensive", "disappointed", "problem", "problems", "never", "horrible", "unhelpful")
+
+score_text <- function(text) {
+  words <- stringr::str_extract_all(tolower(text), "[a-z]+")[[1]]
+  sum(words %in% positive_words) - sum(words %in% negative_words)
+}
+
+airline$sentiment_score <- vapply(airline$review_text, score_text, numeric(1))
+hotel$sentiment_score <- vapply(hotel$review_text, score_text, numeric(1))
+airline$word_count <- stringr::str_count(airline$review_text, "\\S+")
+hotel$word_count <- stringr::str_count(hotel$review_text, "\\S+")
+
+fit_rating_model <- function(df, label) {
+  model_data <- df |> dplyr::select(rating, sentiment_score, word_count) |> dplyr::filter(is.finite(rating), is.finite(sentiment_score), is.finite(word_count))
+  if (nrow(model_data) < 30) return(NULL)
+  if (nrow(model_data) > 20000) model_data <- model_data |> dplyr::slice_sample(n = 20000)
+
+  idx <- sample(seq_len(nrow(model_data)), size = floor(0.8 * nrow(model_data)))
+  train <- model_data[idx, , drop = FALSE]
+  test <- model_data[-idx, , drop = FALSE]
+
+  fit <- lm(rating ~ sentiment_score + word_count, data = train)
+  predictions <- predict(fit, newdata = test)
+
+  metrics <- data.frame(
+    Dataset = label, Training_rows = nrow(train), Testing_rows = nrow(test),
+    MAE = round(mean(abs(test$rating - predictions)), 4), RMSE = round(sqrt(mean((test$rating - predictions)^2)), 4),
+    Test_R2 = round(1 - sum((test$rating - predictions)^2) / sum((test$rating - mean(test$rating))^2), 4)
+  )
+  print(metrics)
+
+  p <- ggplot(data.frame(Actual = test$rating, Predicted = as.numeric(predictions)), aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.3, color = "#2878B5") + geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#D18B2C") +
+    labs(title = paste(label, "Actual vs Predicted Ratings"), x = "Actual Rating", y = "Predicted Rating") + theme_minimal(base_size = 12)
+  print(p)
+  ggsave(file.path(output_dir, paste0(tolower(label), "_actual_vs_predicted.png")), p, width = 7, height = 6, dpi = 150)
+  list(model = fit, metrics = metrics)
+}
+
+airline_model <- fit_rating_model(airline, "Airline")
+hotel_model <- fit_rating_model(hotel, "Hotel")
+if (!is.null(airline_model)) knitr::kable(airline_model$metrics, caption = "Airline rating model metrics")
+if (!is.null(hotel_model)) knitr::kable(hotel_model$metrics, caption = "Hotel rating model metrics")
+```
+
+# Step 10: Recommendations and saved artifacts
+
+Recommendations are generated from the observed rating groups. They should be reviewed alongside the detailed charts and actual review text before any business decision is made.
+
+```{r recommendations}
+make_recommendations <- function(df, label) {
+  valid <- df |> dplyr::filter(!is.na(rating))
+  positive_pct <- mean(valid$rating_group == "Positive") * 100
+  negative_pct <- mean(valid$rating_group == "Negative") * 100
+
+  cat("\n===============", label, "INSIGHTS ================\n")
+  cat("Average rating:", round(mean(valid$rating), 2), "\n")
+  if (negative_pct >= 30) {
+    cat("Recommendation: investigate recurring complaints and service failures.\n")
+  } else {
+    cat("Recommendation: preserve factors associated with strong ratings.\n")
+  }
+}
+
+make_recommendations(airline, "Airline")
+make_recommendations(hotel, "Hotel")
+
+# Save clean data and compress outputs
+write.csv(airline, file.path(output_dir, "airline_cleaned.csv"), row.names = FALSE, na = "")
+write.csv(hotel, file.path(output_dir, "hotel_cleaned.csv"), row.names = FALSE, na = "")
+
+zip_output <- file.path(output_dir, "review_analysis_outputs.zip")
+if (file.exists(zip_output)) file.remove(zip_output)
+if (file.exists(zip_output)) file.remove(zip_output); old_wd <- getwd(); setwd(output_dir); utils::zip(zipfile = basename(zip_output), files = setdiff(list.files(".", full.names = FALSE), basename(zip_output)), flags = "-r", extras = "-j"); setwd(old_wd)
+cat("\nDownload the output archive from:", zip_output, "\n")
+```
+
+# Limitations
+
+- Results depend on the quality, coverage, and representativeness of the supplied review datasets.
+- Rating-based positive/neutral/negative groups use thresholds and are not the same as independently labeled sentiment.
+- The sentiment lexicon is small and may misclassify negation, sarcasm, mixed sentiment, and context-specific phrases.
+- The regression model uses only sentiment score and review word count; its metrics should be compared with stronger baselines before deployment.
+- Association in review data does not establish causation.
+
+# Conclusion
+
+This analysis provides a reproducible workflow for comparing airline and hotel reviews, checking data quality, exploring rating patterns, identifying frequent terms, and evaluating a simple rating-prediction baseline. The generated outputs can support further investigation into recurring customer concerns and service strengths.
+
+# References
+
+1. Wickham, H. et al. **dplyr: A Grammar of Data Manipulation**. R package documentation.
+2. Wickham, H. **ggplot2: Elegant Graphics for Data Analysis**. Springer.
+3. Silge, J. and Robinson, D. **Text Mining with R: A Tidy Approach**. O'Reilly Media.
+4. R Core Team. **R: A Language and Environment for Statistical Computing**.
