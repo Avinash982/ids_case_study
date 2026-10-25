@@ -1,0 +1,13 @@
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+
+.ipynb_checkpoints/
+__pycache__/
+
+data/*.csv
+data/*.zip
+
+.DS_Store
+Thumbs.db
